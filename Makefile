@@ -253,6 +253,7 @@ ifneq (,$(findstring -DBUILD_SHARED_LIBS=OFF,$(CMAKE_ARGS)))
 	cp build/ggml/src/libggml.a .
 	cp build/ggml/src/libggml-base.a .
 	cp build/ggml/src/libggml-cpu.a .
+	cp build/ggml/src/ggml-cuda/libggml-cuda.a
 else
 	@echo "Copying shared libraries..."
 	cp build/bin/libllama.so .
