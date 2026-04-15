@@ -184,9 +184,20 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 		if opts.TopK != nil {
 			genOpts = append(genOpts, WithTopK(*opts.TopK))
 		}
+		if opts.MinP != nil {
+			genOpts = append(genOpts, WithMinP(*opts.MinP))
+		}
+		if opts.PresencePenalty != nil {
+			genOpts = append(genOpts, WithPresencePenalty(*opts.PresencePenalty))
+		}
+		if opts.RepeatPenalty != nil {
+			genOpts = append(genOpts, WithRepeatPenalty(*opts.RepeatPenalty))
+		}		
 		if opts.Seed != nil {
 			genOpts = append(genOpts, WithSeed(*opts.Seed))
 		}
+
+
 
 		// Use context's GenerateChannel
 		tokenCh, genErrCh := c.GenerateChannel(ctx, prompt, genOpts...)
