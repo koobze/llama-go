@@ -1,0 +1,1 @@
+CGO_LDFLAGS="-L. -l:libggml-cuda.a -l:libllama.a -l:libbinding.a -l:libcommon.a -l:libggml.a -l:libggml-base.a -l:libggml-cpu.a -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -l:libcublas_static.a -l:libcublasLt_static.a -l:libcudart_static.a -lcuda -lculibos -ldl -lrt -lpthread" LIBRARY_PATH=. C_INCLUDE_PATH=. LD_LIBRARY_PATH=. go build ./examples/simple
