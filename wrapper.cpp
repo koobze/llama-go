@@ -5,7 +5,12 @@
 #include "llama.cpp/common/sampling.h"
 #include "llama.cpp/common/speculative.h"
 #include "llama.cpp/common/chat.h"
-#include "llama.cpp/vendor/nlohmann/json.hpp"
+// Use angle-bracket form so this resolves via -I paths in both modes:
+// dev (-I./llama.cpp/vendor → submodule) and consumer
+// (-I./cgo_headers/llama.cpp/thirdparty → vendored copy). The vendored copy
+// can't live under a directory named "vendor" because Go's module zip excludes
+// any nested vendor/ subtree.
+#include <nlohmann/json.hpp>
 
 #include <string>
 #include <vector>
@@ -119,6 +124,10 @@ static struct llama_context_params convert_context_params(llama_wrapper_model_pa
     struct llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = params.n_ctx > 0 ? params.n_ctx : 2048;
     ctx_params.n_batch = params.n_batch > 0 ? params.n_batch : 512;
+    // n_ubatch: 0 means match n_batch. Encoder-only models (nomic, BERT) require
+    // n_ubatch >= longest sequence length, since the whole input must fit in one
+    // forward pass.
+    ctx_params.n_ubatch = params.n_ubatch > 0 ? params.n_ubatch : ctx_params.n_batch;
     ctx_params.n_threads = params.n_threads > 0 ? params.n_threads : 4;
     ctx_params.n_threads_batch = params.n_threads_batch > 0 ? params.n_threads_batch : ctx_params.n_threads;
     ctx_params.n_seq_max = params.n_parallel > 0 ? params.n_parallel : 1;
@@ -656,21 +665,27 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
             return nullptr;
         }
 
-        // Set up speculative parameters
-        // Since b8635, common_speculative_init creates its own draft context internally
-        // from the model pointer, so we pass the draft model rather than a pre-created context
+        // Set up speculative parameters.
+        // b9002+: common_params_speculative uses a nested draft substructure
+        // (params.draft.* instead of the flat fields used pre-b9002).
+        // common_speculative_init checks !params.draft.mparams.path.empty() to
+        // decide whether the draft implementation should be registered, so the
+        // path field must be set even though we're passing the model directly.
         common_params_speculative spec_params;
-        spec_params.n_max = params.n_draft > 0 ? params.n_draft : 16;
-        spec_params.p_min = 0.75f;
         spec_params.type = COMMON_SPECULATIVE_TYPE_DRAFT;
-        spec_params.model_dft = wrapper_dft->model;
-        spec_params.mparams_dft.path = "draft";
 
-        spec_params.cparams_dft = llama_context_default_params();
-        spec_params.cparams_dft.n_ctx           = llama_n_ctx(wrapper_dft->ctx);
-        spec_params.cparams_dft.n_batch         = llama_n_batch(wrapper_dft->ctx);
-        spec_params.cparams_dft.n_threads       = llama_n_threads(wrapper_dft->ctx);
-        spec_params.cparams_dft.n_threads_batch = llama_n_threads_batch(wrapper_dft->ctx);
+        // Configure draft model parameters
+        spec_params.draft.n_max = params.n_draft > 0 ? params.n_draft : 16;
+        spec_params.draft.p_min = 0.75f;
+        spec_params.draft.model = wrapper_dft->model;
+        spec_params.draft.mparams.path = "draft";
+
+        // Draft context parameters
+        spec_params.draft.cparams = llama_context_default_params();
+        spec_params.draft.cparams.n_ctx           = llama_n_ctx(wrapper_dft->ctx);
+        spec_params.draft.cparams.n_batch         = llama_n_batch(wrapper_dft->ctx);
+        spec_params.draft.cparams.n_threads       = llama_n_threads(wrapper_dft->ctx);
+        spec_params.draft.cparams.n_threads_batch = llama_n_threads_batch(wrapper_dft->ctx);
 
         // Initialize speculative sampling
         common_speculative* spec = common_speculative_init(spec_params, wrapper_tgt->ctx);

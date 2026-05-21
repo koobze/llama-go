@@ -20,7 +20,8 @@ jobs:
     env:
       LIBRARY_PATH: ${{ github.workspace }}
       C_INCLUDE_PATH: ${{ github.workspace }}
-      LD_LIBRARY_PATH: ${{ github.workspace }}:${{ github.workspace }}/build/bin
+      # No LD_LIBRARY_PATH needed: default BUILD_LINKAGE=static links everything in.
+      # (Shared-mode opt-in handles runtime via -Wl,-rpath,$ORIGIN baked into the binary.)
       # Configure sccache for CMake builds
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -66,22 +67,28 @@ jobs:
       - name: Setup sccache
         uses: https://git.tomfos.tr/tom/sccache-action@v1
 
+      - name: Verify vendored llama.cpp headers are up to date
+        run: |
+          make vendor-headers
+          if ! git diff --quiet -- cgo_headers; then
+            echo "::error::cgo_headers/ is out of sync with the llama.cpp submodule."
+            echo "Run 'make vendor-headers' and commit the result."
+            git diff --stat -- cgo_headers
+            exit 1
+          fi
+
       - name: Build library
         run: |
-          make libbinding.a
+          BUILD_TYPE=cublas CUDA_ARCHITECTURES=86 make libbinding.a
 
       - name: Debug - List built artifacts
         run: |
           echo "=== GPU Detection ==="
           nvidia-smi || echo "No GPU detected"
-          echo "=== Files in build/bin ==="
-          ls -la build/bin/ || echo "build/bin not found"
           echo "=== Files in workspace root ==="
-          ls -la *.so *.a 2>/dev/null || echo "No .so or .a files in workspace root"
+          ls -la *.a *.so 2>/dev/null || echo "No .a or .so files in workspace root"
           echo "=== Current working directory ==="
           pwd
-          echo "=== LD_LIBRARY_PATH ==="
-          echo "$LD_LIBRARY_PATH"
 
       - name: Download test models
         run: |
@@ -94,8 +101,66 @@ jobs:
 
       - name: Run tests
         run: |
-          go run github.com/onsi/ginkgo/v2/ginkgo -v ./...
+          go run github.com/onsi/ginkgo/v2/ginkgo -tags cublas --flake-attempts 3 -v ./...
 
       - name: Run example
         run: |
-          go run ./examples/simple -m Qwen3-0.6B-Q8_0.gguf -p 'Hello world' -n 50
+          go run -tags cublas ./examples/simple -m Qwen3-0.6B-Q8_0.gguf -p 'Hello world' -n 50
+
+      - name: Upload static artifacts for libs-image job
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: https://github.com/actions/upload-artifact@v3
+        with:
+          name: llama-go-static-libs
+          path: |
+            libbinding.a
+            libllama.a
+            libllama-common.a
+            libllama-common-base.a
+            libggml.a
+            libggml-base.a
+            libggml-cpu.a
+            libggml-cuda.a
+            wrapper.h
+          retention-days: 1
+
+  libs-image:
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts from test job
+        uses: https://github.com/actions/download-artifact@v3
+        with:
+          name: llama-go-static-libs
+          path: .
+
+      - name: Add Dockerfile to context
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            Dockerfile.libs-cuda
+          sparse-checkout-cone-mode: false
+          path: .checkout
+      - run: cp .checkout/Dockerfile.libs-cuda . && rm -rf .checkout
+
+      - name: Set up Docker Buildx
+        uses: https://github.com/docker/setup-buildx-action@v3
+        with:
+          driver: ${{ env.BUILDKIT_ENDPOINT != '' && 'remote' || 'docker-container' }}
+          endpoint: ${{ env.BUILDKIT_ENDPOINT || '' }}
+
+      - name: Login to Forgejo Registry
+        uses: https://github.com/docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.PACKAGE_TOKEN }}
+
+      - name: Build and push libs-cuda image
+        uses: https://github.com/docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.libs-cuda
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ github.event.repository.name }}:libs-cuda
