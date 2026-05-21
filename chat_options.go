@@ -19,6 +19,9 @@ type ChatOptions struct {
 	Temperature *float32 // Sampling temperature (nil = model default, typically 0.8)
 	TopP        *float32 // Nucleus sampling threshold (nil = model default, typically 0.95)
 	TopK        *int     // Top-K sampling (nil = model default, typically 40)
+	MinP		*float32 // 
+	PresencePenalty *float32 //
+	RepeatPenalty *float32 //
 	Seed        *int     // Random seed for reproducible generation (nil = random)
 	StopWords   []string // Additional stop sequences beyond model defaults
 
