@@ -36,6 +36,7 @@ endif
 #
 
 BUILD_TYPE?=
+BUILD_LINKAGE?=static
 # keep standard at C11 and C++17
 CFLAGS   = -I./llama.cpp -I. -O3 -DNDEBUG -std=c11 -fPIC
 CXXFLAGS = -I./llama.cpp -I. -I./llama.cpp/common -I./common -I./llama.cpp/ggml/include -I./llama.cpp/include -I./llama.cpp/vendor -O3 -DNDEBUG -std=c++17 -fPIC
@@ -145,6 +146,9 @@ ifeq ($(BUILD_TYPE),cublas)
 		CMAKE_ARGS+=-DCMAKE_CUDA_ARCHITECTURES="$(CUDA_ARCHITECTURES)"
 	endif
 	EXTRA_TARGETS+=llama.cpp/ggml-cuda.o
+	BACKEND_STATIC_LIBS=build/ggml/src/ggml-cuda/libggml-cuda.a
+	BACKEND_SHARED_LIBS=build/bin/libggml-cuda.so
+	BACKEND_SHARED_BASENAMES=libggml-cuda.so
 endif
 
 ifeq ($(BUILD_TYPE),hipblas)
@@ -158,12 +162,18 @@ ifeq ($(BUILD_TYPE),hipblas)
 	CXXFLAGS+=-DGGML_USE_HIP
 	EXTRA_TARGETS+=llama.cpp/ggml-cuda.o
 	GGML_CUDA_OBJ_PATH=ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/ggml-cuda.cu.o
+	BACKEND_STATIC_LIBS=build/ggml/src/ggml-hip/libggml-hip.a
+	BACKEND_SHARED_LIBS=build/bin/libggml-hip.so
+	BACKEND_SHARED_BASENAMES=libggml-hip.so
 endif
 
 ifeq ($(BUILD_TYPE),clblas)
 	EXTRA_LIBS=
 	CMAKE_ARGS+=-DGGML_OPENCL=ON
 	EXTRA_TARGETS+=llama.cpp/ggml-opencl.o
+	BACKEND_STATIC_LIBS=build/ggml/src/ggml-opencl/libggml-opencl.a
+	BACKEND_SHARED_LIBS=build/bin/libggml-opencl.so
+	BACKEND_SHARED_BASENAMES=libggml-opencl.so
 endif
 
 ifeq ($(BUILD_TYPE),metal)
@@ -171,11 +181,46 @@ ifeq ($(BUILD_TYPE),metal)
 	CGO_LDFLAGS+="-framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders"
 	CMAKE_ARGS+=-DGGML_METAL=ON
 	EXTRA_TARGETS+=llama.cpp/ggml-metal.o
+	BACKEND_STATIC_LIBS=build/ggml/src/ggml-metal/libggml-metal.a
+	BACKEND_SHARED_LIBS=build/bin/libggml-metal.dylib
+	BACKEND_SHARED_BASENAMES=libggml-metal.dylib
+endif
+
+ifeq ($(BUILD_TYPE),vulkan)
+	EXTRA_LIBS=
+	CMAKE_ARGS+=-DGGML_VULKAN=ON
+	BACKEND_STATIC_LIBS=build/ggml/src/ggml-vulkan/libggml-vulkan.a
+	BACKEND_SHARED_LIBS=build/bin/libggml-vulkan.so
+	BACKEND_SHARED_BASENAMES=libggml-vulkan.so
+endif
+
+ifeq ($(BUILD_TYPE),sycl)
+	EXTRA_LIBS=
+	CMAKE_ARGS+=-DGGML_SYCL=ON
+	BACKEND_STATIC_LIBS=build/ggml/src/ggml-sycl/libggml-sycl.a
+	BACKEND_SHARED_LIBS=build/bin/libggml-sycl.so
+	BACKEND_SHARED_BASENAMES=libggml-sycl.so
 endif
 
 ifdef CLBLAST_DIR
 	CMAKE_ARGS+=-DCLBlast_dir=$(CLBLAST_DIR)
 endif
+
+# Static linkage is the default. Translate BUILD_LINKAGE=static into the cmake
+# arg upstream needs. Users can override by setting BUILD_LINKAGE=shared (.so files
+# get copied into the workspace; runtime requires the libraries to be discoverable,
+# which the shared-mode CGO LDFLAGS handle via -Wl,-rpath,$$ORIGIN).
+ifeq ($(BUILD_LINKAGE),static)
+	CMAKE_ARGS+=-DBUILD_SHARED_LIBS=OFF
+endif
+
+# Common library files (always copied regardless of backend).
+# Note llama-common-base is a separate static archive that holds llama_build_*
+# symbols (build-info.cpp). In shared mode it gets folded into libllama-common.so,
+# but in static mode it must be linked separately.
+COMMON_STATIC_LIBS = build/common/libllama-common.a build/common/libllama-common-base.a build/src/libllama.a build/ggml/src/libggml.a build/ggml/src/libggml-base.a build/ggml/src/libggml-cpu.a
+COMMON_SHARED_LIBS = build/bin/libllama-common.so build/bin/libllama.so build/bin/libggml.so build/bin/libggml-base.so build/bin/libggml-cpu.so
+COMMON_SHARED_BASENAMES = libllama-common.so libllama.so libggml.so libggml-base.so libggml-cpu.so
 
 # TODO: support Windows
 ifeq ($(GPU_TESTS),true)
@@ -198,6 +243,7 @@ $(info I CXXFLAGS: $(CXXFLAGS))
 $(info I CGO_LDFLAGS:  $(CGO_LDFLAGS))
 $(info I LDFLAGS:  $(LDFLAGS))
 $(info I BUILD_TYPE:  $(BUILD_TYPE))
+$(info I BUILD_LINKAGE:  $(BUILD_LINKAGE))
 $(info I CMAKE_ARGS:  $(CMAKE_ARGS))
 $(info I EXTRA_TARGETS:  $(EXTRA_TARGETS))
 $(info I CC:       $(CCV))
@@ -241,32 +287,55 @@ llama.cpp/log.o: llama.cpp/ggml.o
 wrapper.o:
 	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common -I./llama.cpp/ggml/include -I./llama.cpp/include wrapper.cpp -o wrapper.o -c $(LDFLAGS)
 
+# Vendored llama.cpp headers. Consumers fetching this repo through the Go module
+# proxy don't get the llama.cpp git submodule, so wrapper.cpp's #include
+# "llama.cpp/..." paths fail to resolve at their build time. We mirror the small
+# subset of headers wrapper.cpp transitively pulls in into cgo_headers/, ship
+# that directory through the module, and the cgo build system adds -I./cgo_headers
+# to its CFLAGS (see linkage_*.go) so the includes resolve from there as a
+# fallback when the submodule isn't present.
+#
+# A sentinel file is touched after vendoring so the libbinding.a build can
+# depend on the headers being present without having to track every individual
+# header. Refresh after a submodule bump with `make vendor-headers` (or simply
+# `make clean && make libbinding.a` — clean wipes cgo_headers/ and the next
+# build re-vendors from the current submodule state).
+.PHONY: vendor-headers
+
+vendor-headers cgo_headers/.vendored:
+	@echo "Vendoring llama.cpp headers into cgo_headers/..."
+	rm -rf cgo_headers
+	mkdir -p cgo_headers/llama.cpp/thirdparty
+	# Mirror include/, ggml/include/ and common/ verbatim. The submodule's
+	# vendor/ subtree is renamed to thirdparty/ in our copy because Go's module
+	# zip excludes any nested directory named "vendor" (reserved for Go's
+	# vendoring mechanism).
+	cd llama.cpp && find include ggml/include common \
+	  \( -name '*.h' -o -name '*.hpp' -o -name '*.inl' \) -print0 | \
+	  tar --null --files-from=- -cf - | tar -xf - -C ../cgo_headers/llama.cpp
+	cd llama.cpp/vendor && find . \
+	  \( -name '*.h' -o -name '*.hpp' -o -name '*.inl' \) -print0 | \
+	  tar --null --files-from=- -cf - | tar -xf - -C ../../cgo_headers/llama.cpp/thirdparty
+	@touch cgo_headers/.vendored
+
 # All Go bindings are now handled through wrapper.cpp
 
-libbinding.a: llama.cpp/ggml.o wrapper.o $(EXTRA_TARGETS)
-	cd build && cmake --build . --target common
+libbinding.a: cgo_headers/.vendored llama.cpp/ggml.o wrapper.o $(EXTRA_TARGETS)
+	cd build && cmake --build . --target llama-common
 	ar crs libbinding.a wrapper.o $(EXTRA_TARGETS)
-	cp build/common/libcommon.a .
-ifneq (,$(findstring -DBUILD_SHARED_LIBS=OFF,$(CMAKE_ARGS)))
-	@echo "Copying static libraries..."
-	cp build/src/libllama.a .
-	cp build/ggml/src/libggml.a .
-	cp build/ggml/src/libggml-base.a .
-	cp build/ggml/src/libggml-cpu.a .
-	cp build/ggml/src/ggml-cuda/libggml-cuda.a
+ifeq ($(BUILD_LINKAGE),static)
+	@echo "Copying static libraries (BUILD_LINKAGE=static)..."
+	cp $(COMMON_STATIC_LIBS) .
+ifneq ($(BACKEND_STATIC_LIBS),)
+	cp $(BACKEND_STATIC_LIBS) .
+endif
 else
-	@echo "Copying shared libraries..."
-	cp build/bin/libllama.so .
-	cp build/bin/libggml.so .
-	cp build/bin/libggml-base.so .
-	cp build/bin/libggml-cpu.so .
-	ln -sf libllama.so libllama.so.0
-	ln -sf libggml.so libggml.so.0
-	ln -sf libggml-base.so libggml-base.so.0
-	ln -sf libggml-cpu.so libggml-cpu.so.0
-ifeq ($(BUILD_TYPE),cublas)
-	cp build/bin/libggml-cuda.so .
-	ln -sf libggml-cuda.so libggml-cuda.so.0
+	@echo "Copying shared libraries (BUILD_LINKAGE=shared)..."
+	cp $(COMMON_SHARED_LIBS) .
+	@for lib in $(COMMON_SHARED_BASENAMES); do ln -sf $$lib $$lib.0; done
+ifneq ($(BACKEND_SHARED_LIBS),)
+	cp $(BACKEND_SHARED_LIBS) .
+	@for lib in $(BACKEND_SHARED_BASENAMES); do ln -sf $$lib $$lib.0; done
 endif
 endif
 
@@ -275,6 +344,7 @@ clean:
 	rm -rf *.a
 	rm -rf *.so *.so.0
 	rm -rf llama.cpp/*.o
+	rm -rf cgo_headers
 	cd llama.cpp && git checkout -- . && git clean -fd
 	rm -rf build
 
