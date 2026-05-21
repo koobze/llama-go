@@ -25,3 +25,7 @@ CLAUDE.md
 # local testing files
 ggllm-test-model.bin
 *.gguf
+
+*.a
+*.o
+*.sh
